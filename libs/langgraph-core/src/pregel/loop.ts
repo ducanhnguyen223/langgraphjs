@@ -394,6 +394,15 @@ export class PregelLoop {
   protected _checkpointerChainedPromise: Promise<unknown> = Promise.resolve();
 
   /**
+   * DeltaChannel writes (and the exit-mode stub checkpoint) saved since the
+   * last checkpoint save was scheduled. That save waits for them, and a
+   * rejection skips it and every later save: a DeltaChannel is rebuilt from
+   * its writes along the parent chain, so a checkpoint saved past a missing
+   * write or parent reads back short for good.
+   */
+  protected _pendingDeltaWrites: Promise<unknown>[] = [];
+
+  /**
    * Track a checkpointer promise, removing it from the set on success.
    * Failed promises are kept so that Promise.all() in the finally block
    * of _streamIterator can surface the error.
@@ -752,16 +761,18 @@ export class PregelLoop {
     metadata: CheckpointMetadata;
     newVersions: Record<string, string | number>;
   }) {
-    this._checkpointerChainedPromise = this._checkpointerChainedPromise.then(
-      () => {
+    const pendingDeltaWrites = this._pendingDeltaWrites;
+    this._pendingDeltaWrites = [];
+    this._checkpointerChainedPromise = this._checkpointerChainedPromise
+      .then(() => Promise.all(pendingDeltaWrites))
+      .then(() => {
         return this.checkpointer?.put(
           input.config,
           input.checkpoint,
           input.metadata,
           input.newVersions
         );
-      }
-    );
+      });
     this._trackCheckpointerPromise(this._checkpointerChainedPromise);
   }
 
@@ -828,10 +839,12 @@ export class PregelLoop {
     // before they are serialised. DeltaChannel state is reconstructed by
     // replaying these stored writes, so without stable IDs every getState()
     // replay would mint a fresh UUID and dedup/RemoveMessage would break.
+    let hasDeltaWrite = false;
     for (const [c, v] of writesToSave) {
       const channel = this.channels[c];
       if (channel != null && isDeltaChannel(channel)) {
         ensureMessageIds(v);
+        hasDeltaWrite = true;
       }
     }
 
@@ -841,10 +854,10 @@ export class PregelLoop {
     });
 
     if (this.durability !== "exit" && this.checkpointer != null) {
-      this._trackCheckpointerPromise(
-        // Use sanitized writes for checkpointer
-        this.checkpointer.putWrites(config, writesToSave, taskId)
-      );
+      // Use sanitized writes for checkpointer
+      const saved = this.checkpointer.putWrites(config, writesToSave, taskId);
+      this._trackCheckpointerPromise(saved);
+      if (hasDeltaWrite) this._pendingDeltaWrites.push(saved);
     }
 
     if (this.tasks) {
@@ -1960,14 +1973,14 @@ export class PregelLoop {
       anchorConfig = patchConfigurable(this._initialCheckpointConfig, {
         [CONFIG_KEY_CHECKPOINT_ID]: stubCp.id,
       });
-      this._trackCheckpointerPromise(
-        this.checkpointer.put(
-          stubPutConfig,
-          stubCp,
-          { source: "loop", step: -2, parents: {} },
-          {}
-        )
+      const stubSaved = this.checkpointer.put(
+        stubPutConfig,
+        stubCp,
+        { source: "loop", step: -2, parents: {} },
+        {}
       );
+      this._trackCheckpointerPromise(stubSaved);
+      this._pendingDeltaWrites.push(stubSaved);
       this.checkpointConfig = anchorConfig;
     }
 
@@ -1993,13 +2006,13 @@ export class PregelLoop {
     }
     for (const { key, step, tid } of order) {
       const synthTid = exitDeltaTaskId(step, tid);
-      this._trackCheckpointerPromise(
-        this.checkpointer.putWrites(
-          anchorWriteConfig,
-          grouped.get(key)!,
-          synthTid
-        )
+      const saved = this.checkpointer.putWrites(
+        anchorWriteConfig,
+        grouped.get(key)!,
+        synthTid
       );
+      this._trackCheckpointerPromise(saved);
+      this._pendingDeltaWrites.push(saved);
     }
   }
 
